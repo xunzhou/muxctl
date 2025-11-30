@@ -1,0 +1,53 @@
+provider: claude-code
+cli_args:
+  - "--model claude-haiku-4-5-20251001"
+  - "--output-format json"
+
+# Action-specific settings
+# Template variables: {{context}}, {{content}}, {{truncated}}
+default_actions:
+  summarize:
+    max_lines: 300
+    # Uncomment to override default prompts:
+    # system_prompt: |
+    #   You are analyzing terminal output. Be concise and actionable.
+    # user_prompt: |
+    #   Context:
+    #   {{context}}
+    #
+    #   Here is the terminal output:{{truncated}}
+    #
+    #   {{content}}
+    #
+    #   Tasks:
+    #   1. Briefly summarize what's happening (2-3 sentences max).
+    #   2. Highlight any errors, warnings, or anomalies.
+    #   3. Suggest 2-3 concrete next steps.
+
+  explain:
+    max_lines: 100
+    # Uncomment to override default prompts:
+    # system_prompt: |
+    #   You are helping interpret CLI output and error messages. Be concise and provide actionable guidance.
+    # user_prompt: |
+    #   Context:
+    #   {{context}}
+    #
+    #   CLI output:{{truncated}}
+    #
+    #   {{content}}
+    #
+    #   Tasks:
+    #   1. Identify the most likely root cause (1-2 sentences).
+    #   2. Explain the error in simple terms.
+    #   3. Suggest 2-3 concrete commands or checks to run next.
+
+# Custom actions example
+custom_actions:
+  analyze-performance:
+    max_lines: 500
+    system_prompt: |
+      You are a performance analysis expert.
+    user_prompt: |
+      Analyze the following output for performance issues:
+      {{content}}
