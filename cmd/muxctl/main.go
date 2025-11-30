@@ -316,6 +316,9 @@ func init() {
 	aiCmd.AddCommand(aiExplainCmd)
 	aiCmd.AddCommand(aiConfigCmd)
 
+	// Register custom AI actions from config
+	registerCustomAICommands()
+
 	// Init flags
 	initCmd.Flags().IntVar(&initTopPercent, "top-percent", 30, "Percentage of screen for top pane")
 	initCmd.Flags().IntVar(&initSidePercent, "side-percent", 40, "Percentage of bottom for side pane")
@@ -566,6 +569,81 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 // === AI Commands ===
 
+// registerCustomAICommands dynamically registers custom AI actions from config as subcommands.
+func registerCustomAICommands() {
+	cfg, err := ai.LoadConfig()
+	if err != nil {
+		// Silently skip if config can't be loaded - will error at runtime
+		return
+	}
+
+	if len(cfg.CustomActions) == 0 {
+		return
+	}
+
+	for name, action := range cfg.CustomActions {
+		// Capture variables for closure
+		actionName := name
+		actionDef := action
+
+		description := actionDef.Description
+		if description == "" {
+			description = fmt.Sprintf("Run custom action '%s'", actionName)
+		}
+
+		cmd := &cobra.Command{
+			Use:   actionName,
+			Short: description,
+			Annotations: map[string]string{
+				"custom": "true",
+			},
+			RunE: func(cmd *cobra.Command, args []string) error {
+				return runAIAction(ai.ActionType(actionName))
+			},
+		}
+
+		// Add standard AI flags
+		cmd.Flags().StringVarP(&aiPaneRole, "pane", "p", "left", "Pane to capture (top, left, right)")
+		cmd.Flags().IntVarP(&aiMaxLines, "lines", "n", 0, "Max lines to capture")
+		cmd.Flags().BoolVarP(&aiLastCommand, "last-command", "l", false, "Capture only last command, output, and exit code")
+
+		aiCmd.AddCommand(cmd)
+	}
+
+	// Set custom help template for ai command
+	aiCmd.SetHelpTemplate(aiHelpTemplate)
+}
+
+const aiHelpTemplate = `{{with (or .Long .Short)}}{{. | trimTrailingWhitespaces}}
+
+{{end}}Usage:{{if .Runnable}}
+  {{.UseLine}}{{end}}{{if .HasAvailableSubCommands}}
+  {{.CommandPath}} [command]{{end}}{{if gt (len .Aliases) 0}}
+
+Aliases:
+  {{.NameAndAliases}}{{end}}{{if .HasExample}}
+
+Examples:
+{{.Example}}{{end}}{{if .HasAvailableSubCommands}}
+
+Available Commands:{{range .Commands}}{{if (and (not (index .Annotations "custom")) .IsAvailableCommand)}}
+  {{rpad .Name .NamePadding }} {{.Short}}{{end}}{{end}}
+
+Custom Actions:{{range .Commands}}{{if (and (index .Annotations "custom") .IsAvailableCommand)}}
+  {{rpad .Name .NamePadding }} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableLocalFlags}}
+
+Flags:
+{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasAvailableInheritedFlags}}
+
+Global Flags:
+{{.InheritedFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{if .HasHelpSubCommands}}
+
+Additional help topics:{{range .Commands}}{{if .IsAdditionalHelpTopicCommand}}
+  {{rpad .CommandPath .CommandPathPadding}} {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableSubCommands}}
+
+Use "{{.CommandPath}} [command] --help" for more information about a command.{{end}}
+`
+
 func runAISummarize(cmd *cobra.Command, args []string) error {
 	return runAIAction(ai.ActionSummarize)
 }
@@ -599,6 +677,18 @@ func runAIConfig(cmd *cobra.Command, args []string) error {
 	}
 	if len(cfg.CLIArgs) > 0 {
 		fmt.Printf("  CLI Args:    %v\n", cfg.CLIArgs)
+	}
+
+	// Show custom actions
+	if len(cfg.CustomActions) > 0 {
+		fmt.Printf("\nCustom Actions:\n")
+		for name, action := range cfg.CustomActions {
+			desc := action.Description
+			if desc == "" {
+				desc = "(no description)"
+			}
+			fmt.Printf("  %s: %s\n", name, desc)
+		}
 	}
 
 	if err := cfg.Validate(); err != nil {

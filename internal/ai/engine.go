@@ -17,6 +17,11 @@ const (
 	ActionExplain   ActionType = "explain"
 )
 
+// IsCustomAction returns true if the action type is a custom action name.
+func (a ActionType) IsCustomAction() bool {
+	return a != ActionSummarize && a != ActionExplain
+}
+
 // ActionInput contains the input data for an AI action.
 type ActionInput struct {
 	PaneContent string         // Captured pane content
@@ -87,7 +92,12 @@ func (e *Engine) Run(ctx context.Context, action ActionType, input ActionInput) 
 			case ActionExplain:
 				maxLines = e.cfg.DefaultActions.Explain.MaxLines
 			default:
-				maxLines = 200
+				// Check if it's a custom action with max_lines configured
+				if customAction, ok := e.cfg.CustomActions[string(action)]; ok && customAction.MaxLines > 0 {
+					maxLines = customAction.MaxLines
+				} else {
+					maxLines = 200
+				}
 			}
 		}
 
@@ -106,7 +116,12 @@ func (e *Engine) Run(ctx context.Context, action ActionType, input ActionInput) 
 		case ActionExplain:
 			messages = e.buildExplainPrompt(input.Context, content, truncated, maxLines)
 		default:
-			return nil, fmt.Errorf("unknown action type: %s", action)
+			// Check if it's a custom action
+			customAction, ok := e.cfg.CustomActions[string(action)]
+			if !ok {
+				return nil, fmt.Errorf("unknown action type: %s", action)
+			}
+			messages = e.buildCustomPrompt(customAction, input.Context, content, truncated, maxLines)
 		}
 	}
 
@@ -199,6 +214,31 @@ Tasks:
 		userPrompt = strings.ReplaceAll(userPrompt, "{{content}}", content)
 		userPrompt = strings.ReplaceAll(userPrompt, "{{truncated}}", truncateNote)
 	}
+
+	return []Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
+	}
+}
+
+// buildCustomPrompt builds the prompt for a custom action.
+func (e *Engine) buildCustomPrompt(action *CustomAction, ctx muxctx.Context, content string, truncated bool, maxLines int) []Message {
+	contextInfo := buildContextInfo(ctx)
+	truncateNote := ""
+	if truncated {
+		truncateNote = fmt.Sprintf("\n(Note: Showing last %d lines, earlier content truncated)", maxLines)
+	}
+
+	systemPrompt := action.SystemPrompt
+	if systemPrompt == "" {
+		systemPrompt = "You are analyzing terminal output. Be concise and actionable."
+	}
+
+	userPrompt := action.UserPrompt
+	// Replace template variables
+	userPrompt = strings.ReplaceAll(userPrompt, "{{context}}", contextInfo)
+	userPrompt = strings.ReplaceAll(userPrompt, "{{content}}", content)
+	userPrompt = strings.ReplaceAll(userPrompt, "{{truncated}}", truncateNote)
 
 	return []Message{
 		{Role: "system", Content: systemPrompt},

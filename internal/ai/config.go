@@ -42,6 +42,21 @@ type CustomAction struct {
 	MaxLines     int    `yaml:"max_lines"`
 	SystemPrompt string `yaml:"system_prompt"`
 	UserPrompt   string `yaml:"user_prompt"` // Supports {{context}}, {{content}}, {{truncated}}
+	Description  string `yaml:"description"` // Short description for CLI help
+}
+
+// GetCustomActionNames returns the names of all custom actions.
+func (c Config) GetCustomActionNames() []string {
+	names := make([]string, 0, len(c.CustomActions))
+	for name := range c.CustomActions {
+		names = append(names, name)
+	}
+	return names
+}
+
+// GetCustomAction returns a custom action by name, or nil if not found.
+func (c Config) GetCustomAction(name string) *CustomAction {
+	return c.CustomActions[name]
 }
 
 // DefaultConfig returns the default configuration.

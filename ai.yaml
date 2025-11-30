@@ -43,8 +43,10 @@ default_actions:
     #   3. Suggest 2-3 concrete commands or checks to run next.
 
 # Custom actions example
+# These appear as subcommands under `muxctl ai <action-name>`
 custom_actions:
   analyze-performance:
+    description: "Analyze output for performance issues"
     max_lines: 500
     system_prompt: |
       You are a performance analysis expert.
