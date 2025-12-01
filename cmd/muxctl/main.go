@@ -116,10 +116,18 @@ var runCmd = &cobra.Command{
 	Short: "Run a command in a specific pane",
 	Long: `Runs a command in the specified pane. The pane must be initialized first.
 
+With --auto-return, the pane waits for a keypress after the command exits,
+then automatically switches focus back to the specified pane (default: top).
+This is useful for one-shot commands like describe or events.
+
 Examples:
   muxctl run --pane top -- my-tui-app
   muxctl run --pane left -- kubectl logs -f pod-name
-  muxctl run --pane right -- kubectl describe pod pod-name`,
+  muxctl run --pane right -- kubectl describe pod pod-name
+
+  # Auto-return after command completes:
+  muxctl run --pane left --auto-return -- kubectl describe pod my-pod
+  muxctl run --pane left --auto-return --return-to right -- kubectl get events`,
 	RunE:               runRun,
 	DisableFlagParsing: false,
 }
@@ -152,6 +160,32 @@ Examples:
   muxctl clear right`,
 	Args: cobra.ExactArgs(1),
 	RunE: runClear,
+}
+
+var toggleCmd = &cobra.Command{
+	Use:   "toggle <pane>",
+	Short: "Toggle pane visibility (hide/show)",
+	Long: `Toggles the visibility of the specified pane by resizing it.
+
+For "bottom", toggles both left and right panes together,
+giving the top pane 100% height (fullscreen mode).
+
+For "top", toggles the top pane, giving the bottom panes 100% height.
+
+Pane roles: top, left, right, bottom
+
+Keyboard shortcuts:
+  ctrl-j: toggle bottom (fullscreen top pane)
+  ctrl-k: toggle top (fullscreen bottom panes)
+  ctrl-s: toggle right pane
+
+Examples:
+  muxctl toggle bottom   # fullscreen top pane
+  muxctl toggle top      # fullscreen bottom panes
+  muxctl toggle left     # toggle just left pane
+  muxctl toggle right    # toggle just right pane`,
+	Args: cobra.ExactArgs(1),
+	RunE: runToggle,
 }
 
 var sendCmd = &cobra.Command{
@@ -211,7 +245,7 @@ var aiServeCmd = &cobra.Command{
 	Long: `Starts a Unix socket server that accepts AI requests from external processes.
 
 The server listens on /tmp/muxctl-{session}.sock and accepts JSON requests.
-This allows other tools (like sctl) to request AI analysis without calling muxctl directly.
+This allows other tools to request AI analysis without calling muxctl directly.
 
 The server runs until interrupted (Ctrl-C).`,
 	RunE: runAIServe,
@@ -311,7 +345,9 @@ var (
 	initNoAttach    bool
 
 	// Run/send flags
-	paneRole string
+	paneRole      string
+	autoReturn    bool
+	returnToPane  string
 
 	// Logs flags
 	logsFollow    bool
@@ -338,6 +374,7 @@ func init() {
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(focusCmd)
 	rootCmd.AddCommand(clearCmd)
+	rootCmd.AddCommand(toggleCmd)
 	rootCmd.AddCommand(sendCmd)
 	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(aiCmd)
@@ -363,6 +400,8 @@ func init() {
 	// Run flags
 	runCmd.Flags().StringVarP(&paneRole, "pane", "p", "", "Target pane (required: top, left, right)")
 	runCmd.MarkFlagRequired("pane")
+	runCmd.Flags().BoolVar(&autoReturn, "auto-return", false, "Wait for keypress after command exits, then return focus")
+	runCmd.Flags().StringVar(&returnToPane, "return-to", "top", "Pane to focus after auto-return (default: top)")
 
 	// Send flags
 	sendCmd.Flags().StringVarP(&paneRole, "pane", "p", "", "Target pane (required: top, left, right)")
@@ -411,6 +450,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 	if err := tmuxCtrl.Init(sessionName, layout); err != nil {
 		return fmt.Errorf("failed to initialize: %w", err)
 	}
+
+	// Focus top pane by default
+	tmuxCtrl.FocusPane(tmux.RoleTop)
 
 	fmt.Printf("Initialized muxctl session '%s' with 3-pane layout\n", sessionName)
 	fmt.Printf("  @muxctl_top   → top pane\n")
@@ -465,6 +507,18 @@ func runRun(cmd *cobra.Command, args []string) error {
 	ctxManager.Refresh()
 	ctx := ctxManager.Current()
 
+	// If auto-return is enabled, append focus command to run after completion
+	if autoReturn {
+		// Validate return-to pane
+		if _, err := tmux.ParseRole(returnToPane); err != nil {
+			return fmt.Errorf("invalid --return-to pane: %w", err)
+		}
+
+		// Append "; muxctl focus <return-to>" to the last arg
+		// This works because RunInPane uses send-keys which types into the shell
+		cmdArgs = append(cmdArgs, ";", "muxctl", "focus", returnToPane)
+	}
+
 	if err := tmuxCtrl.RunInPane(role, cmdArgs, ctx.Env()); err != nil {
 		return fmt.Errorf("failed to run in pane '%s': %w", role, err)
 	}
@@ -501,6 +555,23 @@ func runClear(cmd *cobra.Command, args []string) error {
 
 	if err := tmuxCtrl.ClearPane(role); err != nil {
 		return fmt.Errorf("failed to clear pane '%s': %w", role, err)
+	}
+
+	return nil
+}
+
+func runToggle(cmd *cobra.Command, args []string) error {
+	if err := requireMuxctlSession(); err != nil {
+		return err
+	}
+
+	role, err := tmux.ParseRole(args[0])
+	if err != nil {
+		return err
+	}
+
+	if err := tmuxCtrl.TogglePane(role); err != nil {
+		return fmt.Errorf("failed to toggle pane '%s': %w", role, err)
 	}
 
 	return nil

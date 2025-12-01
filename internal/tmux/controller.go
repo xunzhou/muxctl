@@ -454,7 +454,33 @@ func (c *TmuxController) registerPanes(panes []PaneInfo) error {
 	}
 	setupWg.Wait()
 
+	// Set up keybindings for pane toggles
+	c.setupKeybindings()
+
 	return nil
+}
+
+// setupKeybindings configures tmux keybindings for muxctl.
+func (c *TmuxController) setupKeybindings() {
+	// Find muxctl binary path
+	muxctlPath, err := exec.LookPath("muxctl")
+	if err != nil {
+		muxctlPath = "muxctl"
+	}
+
+	// Bind ctrl-j to toggle bottom panes (gives top pane 100% height)
+	exec.Command("tmux", "bind-key", "-n", "C-j",
+		"run-shell", fmt.Sprintf("%s toggle bottom", muxctlPath)).Run()
+
+	// Bind ctrl-k to toggle top pane (gives bottom panes 100% height)
+	exec.Command("tmux", "bind-key", "-n", "C-k",
+		"run-shell", fmt.Sprintf("%s toggle top", muxctlPath)).Run()
+
+	// Bind ctrl-s to toggle right pane only
+	exec.Command("tmux", "bind-key", "-n", "C-s",
+		"run-shell", fmt.Sprintf("%s toggle right", muxctlPath)).Run()
+
+	debug.Log("setupKeybindings: bound ctrl-j=toggle bottom, ctrl-k=toggle top, ctrl-s=toggle right")
 }
 
 // setPaneTitle sets the title of a pane.
@@ -833,6 +859,140 @@ func (c *TmuxController) ClearPane(role PaneRole) error {
 	return cmd.Run()
 }
 
+// TogglePane toggles visibility of a pane by resizing it.
+// For "bottom" role, toggles both left and right panes, giving full height to top.
+// For "top" role, toggles top pane, giving full height to bottom panes.
+func (c *TmuxController) TogglePane(role PaneRole) error {
+	// Special case: "bottom" toggles both left and right
+	if role == "bottom" {
+		return c.toggleBottomPanes()
+	}
+
+	// Special case: "top" gives bottom panes full height
+	if role == RoleTop {
+		return c.toggleTopPane()
+	}
+
+	paneID, ok := c.GetPaneID(role)
+	if !ok {
+		return fmt.Errorf("pane '%s' not found or not initialized", role)
+	}
+
+	// Session variable to track hidden state
+	hiddenVar := fmt.Sprintf("@muxctl_%s_hidden", role)
+
+	// Check if pane is currently hidden
+	hidden, _ := c.getSessionVar(hiddenVar)
+	isHidden := hidden == "1"
+
+	debug.Log("TogglePane: role=%s pane=%s hidden=%v", role, paneID, isHidden)
+
+	if isHidden {
+		// Restore pane - resize to 50% of the bottom area
+		cmd := exec.Command("tmux", "resize-pane", "-t", paneID, "-x", "50%")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to restore pane: %w", err)
+		}
+		c.setSessionVar(hiddenVar, "0")
+	} else {
+		// Hide pane - resize to minimum width (2 cells)
+		cmd := exec.Command("tmux", "resize-pane", "-t", paneID, "-x", "2")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to hide pane: %w", err)
+		}
+		c.setSessionVar(hiddenVar, "1")
+	}
+
+	// Focus left pane after toggling right
+	if role == RoleRight {
+		c.FocusPane(RoleLeft)
+	}
+
+	return nil
+}
+
+// toggleBottomPanes toggles both left and right panes together.
+// When hidden, top pane gets 100% height. When shown, restores original layout.
+func (c *TmuxController) toggleBottomPanes() error {
+	topID, ok := c.GetPaneID(RoleTop)
+	if !ok {
+		return fmt.Errorf("top pane not found")
+	}
+
+	leftID, leftOK := c.GetPaneID(RoleLeft)
+	rightID, rightOK := c.GetPaneID(RoleRight)
+
+	// Check if bottom is currently hidden
+	hidden, _ := c.getSessionVar("@muxctl_bottom_hidden")
+	isHidden := hidden == "1"
+
+	debug.Log("toggleBottomPanes: hidden=%v top=%s left=%s right=%s", isHidden, topID, leftID, rightID)
+
+	if isHidden {
+		// Restore bottom panes - resize top to 30%, bottom panes will auto-expand
+		cmd := exec.Command("tmux", "resize-pane", "-t", topID, "-y", "30%")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to restore layout: %w", err)
+		}
+		// Equalize bottom panes
+		if leftOK && rightOK {
+			exec.Command("tmux", "resize-pane", "-t", leftID, "-x", "50%").Run()
+		}
+		c.setSessionVar("@muxctl_bottom_hidden", "0")
+	} else {
+		// Hide bottom panes - resize top to 100%
+		cmd := exec.Command("tmux", "resize-pane", "-t", topID, "-y", "100%")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to maximize top: %w", err)
+		}
+		c.setSessionVar("@muxctl_bottom_hidden", "1")
+		// Focus top pane
+		c.FocusPane(RoleTop)
+	}
+
+	return nil
+}
+
+// toggleTopPane toggles the top pane.
+// When hidden, bottom panes get 100% height. When shown, restores original layout.
+func (c *TmuxController) toggleTopPane() error {
+	topID, ok := c.GetPaneID(RoleTop)
+	if !ok {
+		return fmt.Errorf("top pane not found")
+	}
+
+	leftID, leftOK := c.GetPaneID(RoleLeft)
+
+	// Check if top is currently hidden
+	hidden, _ := c.getSessionVar("@muxctl_top_hidden")
+	isHidden := hidden == "1"
+
+	debug.Log("toggleTopPane: hidden=%v top=%s", isHidden, topID)
+
+	if isHidden {
+		// Restore top pane - resize to 30%
+		cmd := exec.Command("tmux", "resize-pane", "-t", topID, "-y", "30%")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to restore layout: %w", err)
+		}
+		c.setSessionVar("@muxctl_top_hidden", "0")
+	} else {
+		// Hide top pane - resize bottom to 100% (by shrinking top to minimum)
+		// First resize left pane to take full height
+		if leftOK {
+			cmd := exec.Command("tmux", "resize-pane", "-t", leftID, "-y", "100%")
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("failed to maximize bottom: %w", err)
+			}
+		}
+		c.setSessionVar("@muxctl_top_hidden", "1")
+		// Focus left pane
+		c.FocusPane(RoleLeft)
+	}
+
+	return nil
+}
+
 // ListPanes lists all panes in a session.
 func (c *TmuxController) ListPanes(session string) ([]PaneInfo, error) {
 	cmd := exec.Command("tmux", "list-panes", "-t", session, "-F", "#{pane_id}:#{pane_index}:#{pane_title}:#{pane_active}")
@@ -898,7 +1058,9 @@ func ParseRole(s string) (PaneRole, error) {
 		return RoleLeft, nil
 	case "right":
 		return RoleRight, nil
+	case "bottom":
+		return "bottom", nil // pseudo-role for toggling both left and right
 	default:
-		return "", fmt.Errorf("invalid pane role: %s (valid: top, left, right)", s)
+		return "", fmt.Errorf("invalid pane role: %s (valid: top, left, right, bottom)", s)
 	}
 }
