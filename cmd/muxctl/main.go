@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/xunzhou/muxctl/internal/ai"
@@ -13,6 +16,7 @@ import (
 	"github.com/xunzhou/muxctl/internal/debug"
 	"github.com/xunzhou/muxctl/internal/tmux"
 	"github.com/xunzhou/muxctl/internal/ui"
+	pkgai "github.com/xunzhou/muxctl/pkg/ai"
 )
 
 const (
@@ -201,6 +205,34 @@ var aiConfigCmd = &cobra.Command{
 	RunE:  runAIConfig,
 }
 
+var aiServeCmd = &cobra.Command{
+	Use:   "serve",
+	Short: "Start AI socket server for external requests",
+	Long: `Starts a Unix socket server that accepts AI requests from external processes.
+
+The server listens on /tmp/muxctl-{session}.sock and accepts JSON requests.
+This allows other tools (like sctl) to request AI analysis without calling muxctl directly.
+
+The server runs until interrupted (Ctrl-C).`,
+	RunE: runAIServe,
+}
+
+var aiRequestCmd = &cobra.Command{
+	Use:   "request",
+	Short: "Send an AI request via socket or stdin",
+	Long: `Sends an AI request to the socket server or reads from stdin.
+
+This command can be used to test the socket protocol or send requests programmatically.
+
+Examples:
+  # Send request to running server
+  echo '{"action":"summarize","source_pane":"left","target_pane":"right","context":{}}' | muxctl ai request
+
+  # With context file
+  muxctl ai request --context-file /tmp/context.json --action summarize --source left --target right`,
+	RunE: runAIRequest,
+}
+
 // === Status Command ===
 
 var statusCmd = &cobra.Command{
@@ -290,6 +322,8 @@ var (
 	aiPaneRole    string
 	aiMaxLines    int
 	aiLastCommand bool
+	aiContextFile string
+	aiTargetPane  string
 )
 
 func init() {
@@ -315,6 +349,8 @@ func init() {
 	aiCmd.AddCommand(aiSummarizeCmd)
 	aiCmd.AddCommand(aiExplainCmd)
 	aiCmd.AddCommand(aiConfigCmd)
+	aiCmd.AddCommand(aiServeCmd)
+	aiCmd.AddCommand(aiRequestCmd)
 
 	// Register custom AI actions from config
 	registerCustomAICommands()
@@ -341,10 +377,19 @@ func init() {
 	aiSummarizeCmd.Flags().StringVarP(&aiPaneRole, "pane", "p", "left", "Pane to capture (top, left, right)")
 	aiSummarizeCmd.Flags().IntVarP(&aiMaxLines, "lines", "n", 0, "Max lines to capture")
 	aiSummarizeCmd.Flags().BoolVarP(&aiLastCommand, "last-command", "l", false, "Capture only last command, output, and exit code")
+	aiSummarizeCmd.Flags().StringVar(&aiContextFile, "context-file", "", "JSON file with context bundle")
+	aiSummarizeCmd.Flags().StringVar(&aiTargetPane, "target", "", "Target pane for output (default: stdout)")
 
 	aiExplainCmd.Flags().StringVarP(&aiPaneRole, "pane", "p", "left", "Pane to capture")
 	aiExplainCmd.Flags().IntVarP(&aiMaxLines, "lines", "n", 0, "Max lines to capture")
 	aiExplainCmd.Flags().BoolVarP(&aiLastCommand, "last-command", "l", false, "Capture only last command, output, and exit code")
+	aiExplainCmd.Flags().StringVar(&aiContextFile, "context-file", "", "JSON file with context bundle")
+	aiExplainCmd.Flags().StringVar(&aiTargetPane, "target", "", "Target pane for output (default: stdout)")
+
+	// AI request flags
+	aiRequestCmd.Flags().StringVar(&aiContextFile, "context-file", "", "JSON file with context")
+	aiRequestCmd.Flags().StringVar(&aiPaneRole, "source", "left", "Source pane to capture")
+	aiRequestCmd.Flags().StringVar(&aiTargetPane, "target", "right", "Target pane for output")
 
 	// Initialize controllers
 	tmuxCtrl = tmux.NewController()
@@ -731,9 +776,17 @@ func runAIAction(action ai.ActionType) error {
 		return err
 	}
 
-	// Get context
-	ctxManager.Refresh()
-	ctx := ctxManager.Current()
+	// Get context - from file if provided, otherwise from kubectl
+	var ctx muxctx.Context
+	if aiContextFile != "" {
+		ctx, err = loadContextFromFile(aiContextFile)
+		if err != nil {
+			return fmt.Errorf("failed to load context file: %w", err)
+		}
+	} else {
+		ctxManager.Refresh()
+		ctx = ctxManager.Current()
+	}
 
 	var input ai.ActionInput
 
@@ -802,8 +855,31 @@ func runAIAction(action ai.ActionType) error {
 		fmt.Printf("(Note: Input was truncated to last %d lines)\n\n", input.MaxLines)
 	}
 
-	fmt.Println(result.Content)
-	fmt.Println()
+	// If target pane is specified, display result there with a pager
+	if aiTargetPane != "" {
+		targetRole, err := tmux.ParseRole(aiTargetPane)
+		if err != nil {
+			return fmt.Errorf("invalid target pane: %w", err)
+		}
+
+		// Write result to temp file (JSON format)
+		resultFile := "/tmp/muxctl-ai-result.json"
+		if err := os.WriteFile(resultFile, []byte(result.Content), 0644); err != nil {
+			return fmt.Errorf("failed to write result file: %w", err)
+		}
+
+		// Clear and display in target pane using jq + glow pipeline
+		tmuxCtrl.ClearPane(targetRole)
+		cmd := fmt.Sprintf("'jq -r .result %s | glow -p'", resultFile)
+		if err := tmuxCtrl.RunInPane(targetRole, []string{"$SHELL", "-c", cmd}, nil); err != nil {
+			return fmt.Errorf("failed to display in pane: %w", err)
+		}
+
+		fmt.Printf("Result displayed in %s pane\n", aiTargetPane)
+	} else {
+		fmt.Println(result.Content)
+		fmt.Println()
+	}
 
 	return nil
 }
@@ -978,4 +1054,109 @@ func runCompletion(cmd *cobra.Command, args []string) error {
 	default:
 		return fmt.Errorf("unsupported shell: %s", args[0])
 	}
+}
+
+// === AI Socket Server Implementation ===
+
+func runAIServe(cmd *cobra.Command, args []string) error {
+	if err := requireMuxctlSession(); err != nil {
+		return err
+	}
+
+	server, err := pkgai.NewServer(sessionName, tmuxCtrl)
+	if err != nil {
+		return fmt.Errorf("failed to create AI server: %w", err)
+	}
+
+	if err := server.Start(); err != nil {
+		return fmt.Errorf("failed to start AI server: %w", err)
+	}
+
+	fmt.Printf("AI server listening on %s\n", server.GetSocketPath())
+	fmt.Printf("Press Ctrl-C to stop...\n")
+
+	// Wait for interrupt
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	fmt.Printf("\nShutting down...\n")
+	server.Stop()
+
+	return nil
+}
+
+func runAIRequest(cmd *cobra.Command, args []string) error {
+	if err := requireMuxctlSession(); err != nil {
+		return err
+	}
+
+	// Build request from flags or stdin
+	var req pkgai.Request
+
+	// Check if input is from stdin (piped)
+	stat, _ := os.Stdin.Stat()
+	if (stat.Mode() & os.ModeCharDevice) == 0 {
+		// Reading from pipe/file
+		decoder := json.NewDecoder(os.Stdin)
+		if err := decoder.Decode(&req); err != nil {
+			return fmt.Errorf("failed to parse JSON from stdin: %w", err)
+		}
+	} else {
+		// Build request from flags
+		req = pkgai.Request{
+			Action:     "summarize", // Default action
+			SourcePane: aiPaneRole,
+			TargetPane: aiTargetPane,
+			Context:    pkgai.RequestContext{},
+			Options: pkgai.RequestOptions{
+				MaxLines: aiMaxLines,
+			},
+		}
+
+		// Load context from file if provided
+		if aiContextFile != "" {
+			data, err := os.ReadFile(aiContextFile)
+			if err != nil {
+				return fmt.Errorf("failed to read context file: %w", err)
+			}
+			if err := json.Unmarshal(data, &req.Context); err != nil {
+				return fmt.Errorf("failed to parse context file: %w", err)
+			}
+		}
+	}
+
+	// Send to socket server
+	client := pkgai.NewClient(sessionName)
+
+	if !client.IsServerRunning() {
+		return fmt.Errorf("AI server not running. Start it with: muxctl ai serve")
+	}
+
+	resp, err := client.Send(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("AI request failed: %s", resp.Error)
+	}
+
+	fmt.Println("Request sent successfully")
+	return nil
+}
+
+// loadContextFromFile loads context from a JSON file.
+func loadContextFromFile(path string) (muxctx.Context, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return muxctx.Context{}, err
+	}
+
+	var ctx muxctx.Context
+	if err := json.Unmarshal(data, &ctx); err != nil {
+		return muxctx.Context{}, err
+	}
+
+	return ctx, nil
 }

@@ -423,26 +423,36 @@ func (c *TmuxController) registerPanes(panes []PaneInfo) error {
 		}
 	}
 
-	// Set pane titles in parallel (errors ignored for titles)
-	type titleSet struct {
+	// Set MUXCTL session environment variable (for future panes)
+	cmd := exec.Command("tmux", "set-environment", "-t", c.sessionName, "MUXCTL", c.sessionName)
+	cmd.Run() // Ignore error, non-critical
+
+	// Set pane titles and respawn shells with MUXCTL env vars (no visible commands)
+	type paneSetup struct {
 		paneID string
 		title  string
+		role   string
 	}
-	titles := []titleSet{
-		{topID, "[top]"},
-		{leftID, "[left]"},
-		{rightID, "[right]"},
+	paneSetups := []paneSetup{
+		{topID, "[top]", "top"},
+		{leftID, "[left]", "left"},
+		{rightID, "[right]", "right"},
 	}
 
-	var titleWg sync.WaitGroup
-	for _, t := range titles {
-		titleWg.Add(1)
-		go func(paneID, title string) {
-			defer titleWg.Done()
+	var setupWg sync.WaitGroup
+	for _, p := range paneSetups {
+		setupWg.Add(1)
+		go func(paneID, title, role string) {
+			defer setupWg.Done()
 			c.setPaneTitle(paneID, title)
-		}(t.paneID, t.title)
+			// Respawn pane with env vars pre-set (kills current shell, starts fresh with env)
+			exec.Command("tmux", "respawn-pane", "-k", "-t", paneID,
+				"-e", fmt.Sprintf("MUXCTL=%s", c.sessionName),
+				"-e", fmt.Sprintf("MUXCTL_PANE=%s", role),
+			).Run()
+		}(p.paneID, p.title, p.role)
 	}
-	titleWg.Wait()
+	setupWg.Wait()
 
 	return nil
 }
@@ -464,15 +474,53 @@ func (c *TmuxController) RunInPane(role PaneRole, cmdArgs []string, env map[stri
 		return fmt.Errorf("no command specified")
 	}
 
-	// Build environment prefix
-	var envPrefix string
+	// Build environment with muxctl detection vars
+	allEnv := make(map[string]string)
+	// Add muxctl detection variables (like $TMUX for tmux)
+	allEnv["MUXCTL"] = c.sessionName
+	allEnv["MUXCTL_PANE"] = string(role)
+	// Add user-provided env vars (can override if needed)
 	for k, v := range env {
-		envPrefix += fmt.Sprintf("%s=%q ", k, v)
+		allEnv[k] = v
 	}
 
-	cmdStr := envPrefix + strings.Join(cmdArgs, " ")
+	var cmdStr string
+	if debug.IsEnabled() {
+		// Debug mode: show env vars inline for visibility
+		var envPrefix string
+		for k, v := range allEnv {
+			envPrefix += fmt.Sprintf("%s=%q ", k, v)
+		}
+		cmdStr = envPrefix + strings.Join(cmdArgs, " ")
+		debug.Log("RunInPane: role=%s pane=%s cmd=%s", role, paneID, cmdStr)
+	} else {
+		// Normal mode: write env to temp file and use pipe-pane to suppress source output
+		envFile := fmt.Sprintf("/tmp/muxctl-env-%d", os.Getpid())
 
-	debug.Log("RunInPane: role=%s pane=%s cmd=%s", role, paneID, cmdStr)
+		// Write env exports to temp file (not visible in pane)
+		var envContent string
+		for k, v := range allEnv {
+			envContent += fmt.Sprintf("export %s=%q\n", k, v)
+		}
+		if err := os.WriteFile(envFile, []byte(envContent), 0644); err != nil {
+			return fmt.Errorf("failed to write env file: %w", err)
+		}
+
+		// Use pipe-pane to /dev/null to suppress any output from sourcing
+		exec.Command("tmux", "pipe-pane", "-t", paneID, "cat > /dev/null").Run()
+
+		// Source env file silently
+		exec.Command("tmux", "send-keys", "-t", paneID, fmt.Sprintf(". %s", envFile), "Enter").Run()
+
+		// Small delay for source to complete
+		time.Sleep(10 * time.Millisecond)
+
+		// Stop pipe-pane
+		exec.Command("tmux", "pipe-pane", "-t", paneID).Run()
+
+		// Now send the actual command (visible)
+		cmdStr = strings.Join(cmdArgs, " ")
+	}
 
 	cmd := exec.Command("tmux", "send-keys", "-t", paneID, cmdStr, "Enter")
 	return cmd.Run()
