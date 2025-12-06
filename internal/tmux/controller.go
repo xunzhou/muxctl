@@ -90,6 +90,8 @@ type Controller interface {
 	GetPaneID(role PaneRole) (string, bool)
 	GetSessionName() string
 	DetectShell(role PaneRole) ShellType
+	ResizePane(role PaneRole, widthPercent int) error
+	GetPaneSize(role PaneRole) (width, height int, err error)
 }
 
 // TmuxController implements Controller using tmux commands.
@@ -859,6 +861,86 @@ func (c *TmuxController) ClearPane(role PaneRole) error {
 	return cmd.Run()
 }
 
+// SwapPanes swaps the positions of two panes in the current window.
+func (c *TmuxController) SwapPanes(role1, role2 PaneRole) error {
+	pane1ID, ok1 := c.GetPaneID(role1)
+	if !ok1 {
+		return fmt.Errorf("pane '%s' not found or not initialized", role1)
+	}
+
+	pane2ID, ok2 := c.GetPaneID(role2)
+	if !ok2 {
+		return fmt.Errorf("pane '%s' not found or not initialized", role2)
+	}
+
+	debug.Log("SwapPanes: role1=%s pane1=%s role2=%s pane2=%s", role1, pane1ID, role2, pane2ID)
+
+	// Swap the panes
+	cmd := exec.Command("tmux", "swap-pane", "-s", pane1ID, "-t", pane2ID)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to swap panes: %w", err)
+	}
+
+	// Update the stored pane IDs (they've swapped positions)
+	c.setSessionVar(roleToVar(role1), pane2ID)
+	c.setSessionVar(roleToVar(role2), pane1ID)
+
+	return nil
+}
+
+// SwapPanesByTarget swaps two panes using their target identifiers.
+// Targets can be in format: "window:pane" (e.g. "0:1", "mywindow:0")
+// or "window.pane" (tmux native format)
+// or pane IDs (e.g. "%1", "%2")
+// This allows swapping panes across different windows.
+func (c *TmuxController) SwapPanesByTarget(source, target string) error {
+	if !c.Available() {
+		return fmt.Errorf("tmux not available")
+	}
+	if c.sessionName == "" {
+		return fmt.Errorf("no session name set")
+	}
+
+	debug.Log("SwapPanesByTarget: source=%s target=%s session=%s", source, target, c.sessionName)
+
+	// Save originals for error messages
+	origSource := source
+	origTarget := target
+
+	// Qualify targets with session name if they're not pane IDs
+	// Pane IDs start with %
+	qualifiedSource := source
+	qualifiedTarget := target
+
+	if !strings.HasPrefix(source, "%") {
+		// Convert "window:pane" to "session:window.pane" format
+		// or "window.pane" to "session:window.pane"
+		if strings.Contains(source, ":") {
+			// Replace : with . for tmux format
+			source = strings.Replace(source, ":", ".", 1)
+		}
+		qualifiedSource = fmt.Sprintf("%s:%s", c.sessionName, source)
+	}
+
+	if !strings.HasPrefix(target, "%") {
+		if strings.Contains(target, ":") {
+			target = strings.Replace(target, ":", ".", 1)
+		}
+		qualifiedTarget = fmt.Sprintf("%s:%s", c.sessionName, target)
+	}
+
+	debug.Log("SwapPanesByTarget: qualified source=%s target=%s", qualifiedSource, qualifiedTarget)
+
+	// Swap the panes
+	cmd := exec.Command("tmux", "swap-pane", "-s", qualifiedSource, "-t", qualifiedTarget)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to swap panes %s and %s: %w (output: %s)", origSource, origTarget, err, string(output))
+	}
+
+	return nil
+}
+
 // TogglePane toggles visibility of a pane by resizing it.
 // For "bottom" role, toggles both left and right panes, giving full height to top.
 // For "top" role, toggles top pane, giving full height to bottom panes.
@@ -1063,4 +1145,70 @@ func ParseRole(s string) (PaneRole, error) {
 	default:
 		return "", fmt.Errorf("invalid pane role: %s (valid: top, left, right, bottom)", s)
 	}
+}
+
+// ResizePane resizes a pane to the specified width percentage.
+// Only applies to horizontal resizing of left/right panes.
+// widthPercent should be between 1 and 99.
+func (c *TmuxController) ResizePane(role PaneRole, widthPercent int) error {
+	if widthPercent < 1 || widthPercent > 99 {
+		return fmt.Errorf("widthPercent must be between 1 and 99, got %d", widthPercent)
+	}
+
+	paneID, ok := c.GetPaneID(role)
+	if !ok {
+		return fmt.Errorf("pane '%s' not found or not initialized", role)
+	}
+
+	debug.Log("ResizePane: role=%s pane=%s width=%d%%", role, paneID, widthPercent)
+
+	// For left/right panes, resize width (-x)
+	// For top pane, resize height (-y)
+	var cmd *exec.Cmd
+	if role == RoleTop {
+		cmd = exec.Command("tmux", "resize-pane", "-t", paneID, "-y", fmt.Sprintf("%d%%", widthPercent))
+	} else {
+		cmd = exec.Command("tmux", "resize-pane", "-t", paneID, "-x", fmt.Sprintf("%d%%", widthPercent))
+	}
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to resize pane: %w", err)
+	}
+
+	// Store original size in session variable for potential restore
+	sizeVar := fmt.Sprintf("@muxctl_%s_size", role)
+	c.setSessionVar(sizeVar, fmt.Sprintf("%d", widthPercent))
+
+	return nil
+}
+
+// GetPaneSize returns the current width and height of a pane in cells.
+func (c *TmuxController) GetPaneSize(role PaneRole) (width, height int, err error) {
+	paneID, ok := c.GetPaneID(role)
+	if !ok {
+		return 0, 0, fmt.Errorf("pane '%s' not found or not initialized", role)
+	}
+
+	// Query pane dimensions using tmux display-message
+	cmd := exec.Command("tmux", "display-message", "-p", "-t", paneID, "#{pane_width} #{pane_height}")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get pane size: %w", err)
+	}
+
+	// Parse output: "width height"
+	parts := strings.Fields(strings.TrimSpace(string(output)))
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("unexpected output format: %s", string(output))
+	}
+
+	var w, h int
+	if _, err := fmt.Sscanf(parts[0], "%d", &w); err != nil {
+		return 0, 0, fmt.Errorf("failed to parse width: %w", err)
+	}
+	if _, err := fmt.Sscanf(parts[1], "%d", &h); err != nil {
+		return 0, 0, fmt.Errorf("failed to parse height: %w", err)
+	}
+
+	return w, h, nil
 }

@@ -33,6 +33,14 @@ type PaneInfo struct {
 	Active bool
 }
 
+// WindowInfo contains information about a tmux window.
+type WindowInfo struct {
+	Index  int    // Window index
+	Name   string // Window name
+	Active bool   // Currently selected
+	Panes  int    // Number of panes in window
+}
+
 // ShellType represents the shell running in a pane.
 type ShellType string
 

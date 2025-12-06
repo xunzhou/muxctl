@@ -73,7 +73,8 @@ var rootCmd = &cobra.Command{
 	SilenceErrors: true,
 	SilenceUsage:  true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if debugMode {
+		// Enable debug mode via --debug flag or MUXCTL_DEBUG env var
+		if debugMode || os.Getenv("MUXCTL_DEBUG") != "" {
 			if err := debug.Enable(); err != nil {
 				return fmt.Errorf("failed to enable debug logging: %w", err)
 			}
@@ -186,6 +187,35 @@ Examples:
   muxctl toggle right    # toggle just right pane`,
 	Args: cobra.ExactArgs(1),
 	RunE: runToggle,
+}
+
+var swapCmd = &cobra.Command{
+	Use:   "swap <pane1> <pane2>",
+	Short: "Swap positions of two panes",
+	Long: `Swaps the positions of two panes, exchanging their contents and locations.
+
+You can swap panes within the same window using roles, or across different windows
+using window:pane notation.
+
+Within same window (role-based):
+  Pane roles: top, left, right
+
+Cross-window (target-based):
+  Format: window:pane (e.g. "0:1" for window 0, pane 1)
+  Window can be index (0, 1, 2) or name (my-cluster)
+  Pane is the pane index within that window (0, 1, 2)
+
+Examples:
+  # Swap within current window
+  muxctl swap left right
+
+  # Swap across windows
+  muxctl swap 0:1 1:1                    # Window 0 pane 1 <-> Window 1 pane 1
+  muxctl swap main:0 cluster-prod:1      # Named windows
+
+Note: When swapping across windows, the panes exchange positions.`,
+	Args: cobra.ExactArgs(2),
+	RunE: runSwap,
 }
 
 var sendCmd = &cobra.Command{
@@ -303,6 +333,101 @@ This will close all panes and stop any running commands in the session.`,
 	RunE: runKill,
 }
 
+// === Window Commands ===
+
+var windowCmd = &cobra.Command{
+	Use:   "window",
+	Short: "Manage tmux windows",
+	Long: `Manage tmux windows in the current session.
+
+Window management commands allow you to create, list, switch between, and close windows.
+This is useful for managing multiple diagnostic or work contexts.`,
+}
+
+var windowCreateCmd = &cobra.Command{
+	Use:   "create <name>",
+	Short: "Create a new window",
+	Long: `Creates a new tmux window with the specified name.
+
+The window name is set and automatic renaming is disabled to preserve it.
+
+Examples:
+  muxctl window create cluster-prod
+  muxctl window create debug-session`,
+	Args: cobra.ExactArgs(1),
+	RunE: runWindowCreate,
+}
+
+var windowListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List all windows",
+	Long: `Lists all windows in the current session.
+
+Shows window index, name, active status, and number of panes.
+
+Output format:
+  INDEX  NAME           ACTIVE  PANES
+  0      main           *       3
+  1      cluster-prod   -       1`,
+	RunE: runWindowList,
+}
+
+var windowSwitchCmd = &cobra.Command{
+	Use:   "switch <name>",
+	Short: "Switch to a window by name",
+	Long: `Switches focus to the specified window.
+
+Examples:
+  muxctl window switch cluster-prod
+  muxctl window switch main`,
+	Args: cobra.ExactArgs(1),
+	RunE: runWindowSwitch,
+}
+
+var windowCloseCmd = &cobra.Command{
+	Use:   "close <name>",
+	Short: "Close a window by name",
+	Long: `Closes (kills) the specified window.
+
+Warning: This will terminate all processes running in the window.
+
+Examples:
+  muxctl window close cluster-prod
+  muxctl window close debug-session`,
+	Args: cobra.ExactArgs(1),
+	RunE: runWindowClose,
+}
+
+var windowExistsCmd = &cobra.Command{
+	Use:   "exists <name>",
+	Short: "Check if a window exists",
+	Long: `Checks if a window with the given name exists.
+
+Exits with status 0 if the window exists, 1 otherwise.
+Useful for scripting.
+
+Examples:
+  muxctl window exists cluster-prod && echo "exists"
+  if muxctl window exists debug; then ...; fi`,
+	Args: cobra.ExactArgs(1),
+	RunE: runWindowExists,
+}
+
+var windowRunCmd = &cobra.Command{
+	Use:   "run <name> -- <command> [args...]",
+	Short: "Run command in a window",
+	Long: `Runs a command in the first pane of the specified window.
+
+The command is sent to the window's first pane (pane 0).
+
+Examples:
+  muxctl window run cluster-prod -- kubectl get nodes
+  muxctl window run debug -- ls -la`,
+	Args:               cobra.MinimumNArgs(1),
+	RunE:               runWindowRun,
+	DisableFlagParsing: false,
+}
+
 // === Completion Command ===
 
 var completionCmd = &cobra.Command{
@@ -375,10 +500,12 @@ func init() {
 	rootCmd.AddCommand(focusCmd)
 	rootCmd.AddCommand(clearCmd)
 	rootCmd.AddCommand(toggleCmd)
+	rootCmd.AddCommand(swapCmd)
 	rootCmd.AddCommand(sendCmd)
 	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(aiCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(windowCmd)
 	rootCmd.AddCommand(killCmd)
 	rootCmd.AddCommand(completionCmd)
 
@@ -388,6 +515,14 @@ func init() {
 	aiCmd.AddCommand(aiConfigCmd)
 	aiCmd.AddCommand(aiServeCmd)
 	aiCmd.AddCommand(aiRequestCmd)
+
+	// Window subcommands
+	windowCmd.AddCommand(windowCreateCmd)
+	windowCmd.AddCommand(windowListCmd)
+	windowCmd.AddCommand(windowSwitchCmd)
+	windowCmd.AddCommand(windowCloseCmd)
+	windowCmd.AddCommand(windowExistsCmd)
+	windowCmd.AddCommand(windowRunCmd)
 
 	// Register custom AI actions from config
 	registerCustomAICommands()
@@ -416,17 +551,17 @@ func init() {
 	aiSummarizeCmd.Flags().StringVarP(&aiPaneRole, "pane", "p", "left", "Pane to capture (top, left, right)")
 	aiSummarizeCmd.Flags().IntVarP(&aiMaxLines, "lines", "n", 0, "Max lines to capture")
 	aiSummarizeCmd.Flags().BoolVarP(&aiLastCommand, "last-command", "l", false, "Capture only last command, output, and exit code")
-	aiSummarizeCmd.Flags().StringVar(&aiContextFile, "context-file", "", "JSON file with context bundle")
+	aiSummarizeCmd.Flags().StringVarP(&aiContextFile, "context-file", "f", "", "File containing content to analyze (instead of pane capture)")
 	aiSummarizeCmd.Flags().StringVar(&aiTargetPane, "target", "", "Target pane for output (default: stdout)")
 
 	aiExplainCmd.Flags().StringVarP(&aiPaneRole, "pane", "p", "left", "Pane to capture")
 	aiExplainCmd.Flags().IntVarP(&aiMaxLines, "lines", "n", 0, "Max lines to capture")
 	aiExplainCmd.Flags().BoolVarP(&aiLastCommand, "last-command", "l", false, "Capture only last command, output, and exit code")
-	aiExplainCmd.Flags().StringVar(&aiContextFile, "context-file", "", "JSON file with context bundle")
+	aiExplainCmd.Flags().StringVarP(&aiContextFile, "context-file", "f", "", "File containing content to analyze (instead of pane capture)")
 	aiExplainCmd.Flags().StringVar(&aiTargetPane, "target", "", "Target pane for output (default: stdout)")
 
 	// AI request flags
-	aiRequestCmd.Flags().StringVar(&aiContextFile, "context-file", "", "JSON file with context")
+	aiRequestCmd.Flags().StringVarP(&aiContextFile, "context-file", "f", "", "File containing content to analyze")
 	aiRequestCmd.Flags().StringVar(&aiPaneRole, "source", "left", "Source pane to capture")
 	aiRequestCmd.Flags().StringVar(&aiTargetPane, "target", "right", "Target pane for output")
 
@@ -572,6 +707,57 @@ func runToggle(cmd *cobra.Command, args []string) error {
 
 	if err := tmuxCtrl.TogglePane(role); err != nil {
 		return fmt.Errorf("failed to toggle pane '%s': %w", role, err)
+	}
+
+	return nil
+}
+
+func runSwap(cmd *cobra.Command, args []string) error {
+	if err := requireMuxctlSession(); err != nil {
+		return err
+	}
+
+	pane1 := args[0]
+	pane2 := args[1]
+
+	// Check if these are roles (top/left/right) or targets (window:pane)
+	// Roles don't contain ":"
+	isRole1 := !strings.Contains(pane1, ":")
+	isRole2 := !strings.Contains(pane2, ":")
+
+	if isRole1 && isRole2 {
+		// Both are roles - swap within current window
+		role1, err := tmux.ParseRole(pane1)
+		if err != nil {
+			return fmt.Errorf("invalid pane role '%s': %w", pane1, err)
+		}
+
+		role2, err := tmux.ParseRole(pane2)
+		if err != nil {
+			return fmt.Errorf("invalid pane role '%s': %w", pane2, err)
+		}
+
+		if err := tmuxCtrl.SwapPanes(role1, role2); err != nil {
+			return fmt.Errorf("failed to swap panes: %w", err)
+		}
+
+		fmt.Printf("Swapped panes '%s' and '%s'\n", role1, role2)
+	} else {
+		// At least one is a target - use target-based swap
+		// If one is a role, we need to convert it to a target
+		if isRole1 {
+			return fmt.Errorf("cannot mix role-based (%s) and target-based (%s) pane references", pane1, pane2)
+		}
+		if isRole2 {
+			return fmt.Errorf("cannot mix role-based (%s) and target-based (%s) pane references", pane2, pane1)
+		}
+
+		// Both are targets - swap across windows
+		if err := tmuxCtrl.SwapPanesByTarget(pane1, pane2); err != nil {
+			return fmt.Errorf("failed to swap panes: %w", err)
+		}
+
+		fmt.Printf("Swapped panes '%s' and '%s'\n", pane1, pane2)
 	}
 
 	return nil
@@ -841,28 +1027,30 @@ func runAIAction(action ai.ActionType) error {
 		return fmt.Errorf("failed to create AI engine: %w", err)
 	}
 
-	// Resolve pane role
-	role, err := tmux.ParseRole(aiPaneRole)
-	if err != nil {
-		return err
-	}
-
-	// Get context - from file if provided, otherwise from kubectl
-	var ctx muxctx.Context
-	if aiContextFile != "" {
-		ctx, err = loadContextFromFile(aiContextFile)
-		if err != nil {
-			return fmt.Errorf("failed to load context file: %w", err)
-		}
-	} else {
-		ctxManager.Refresh()
-		ctx = ctxManager.Current()
-	}
+	// Get context from kubectl
+	ctxManager.Refresh()
+	ctx := ctxManager.Current()
 
 	var input ai.ActionInput
 
-	if aiLastCommand {
+	if aiContextFile != "" {
+		// Context file mode: read content from file (no pane needed)
+		data, err := os.ReadFile(aiContextFile)
+		if err != nil {
+			return fmt.Errorf("failed to read context file: %w", err)
+		}
+
+		input = ai.ActionInput{
+			PaneContent: string(data),
+			Context:     ctx,
+		}
+	} else if aiLastCommand {
 		// Last command mode: capture command, output, and exit code
+		role, err := tmux.ParseRole(aiPaneRole)
+		if err != nil {
+			return err
+		}
+
 		fmt.Printf("Capturing last command from pane '%s'...\n", aiPaneRole)
 
 		cmdCapture, err := tmuxCtrl.CaptureLastCommand(role)
@@ -890,6 +1078,11 @@ func runAIAction(action ai.ActionType) error {
 		}
 	} else {
 		// Standard mode: capture pane content
+		role, err := tmux.ParseRole(aiPaneRole)
+		if err != nil {
+			return err
+		}
+
 		maxLines := aiMaxLines
 		if maxLines == 0 {
 			switch action {
@@ -1090,6 +1283,159 @@ func runAIOnContent(action ai.ActionType, content string, ctx muxctx.Context) er
 
 // === Kill Command Implementation ===
 
+// === Window Command Implementations ===
+
+func runWindowCreate(cmd *cobra.Command, args []string) error {
+	if err := requireMuxctlSession(); err != nil {
+		return err
+	}
+
+	windowName := args[0]
+
+	// Check if window already exists
+	if tmuxCtrl.WindowExists(windowName) {
+		return fmt.Errorf("window '%s' already exists", windowName)
+	}
+
+	// Create window
+	index, err := tmuxCtrl.CreateWindow(windowName)
+	if err != nil {
+		return fmt.Errorf("failed to create window: %w", err)
+	}
+
+	fmt.Printf("Created window '%s' (index %d)\n", windowName, index)
+	return nil
+}
+
+func runWindowList(cmd *cobra.Command, args []string) error {
+	if err := requireMuxctlSession(); err != nil {
+		return err
+	}
+
+	windows, err := tmuxCtrl.ListWindows()
+	if err != nil {
+		return fmt.Errorf("failed to list windows: %w", err)
+	}
+
+	if len(windows) == 0 {
+		fmt.Println("No windows found")
+		return nil
+	}
+
+	// Print header
+	fmt.Printf("%-6s %-20s %-7s %s\n", "INDEX", "NAME", "ACTIVE", "PANES")
+	fmt.Println(strings.Repeat("-", 50))
+
+	// Print each window
+	for _, w := range windows {
+		activeIndicator := "-"
+		if w.Active {
+			activeIndicator = "*"
+		}
+		fmt.Printf("%-6d %-20s %-7s %d\n", w.Index, w.Name, activeIndicator, w.Panes)
+	}
+
+	return nil
+}
+
+func runWindowSwitch(cmd *cobra.Command, args []string) error {
+	if err := requireMuxctlSession(); err != nil {
+		return err
+	}
+
+	windowName := args[0]
+
+	// Check if window exists
+	if !tmuxCtrl.WindowExists(windowName) {
+		return fmt.Errorf("window '%s' does not exist", windowName)
+	}
+
+	// Switch to window
+	if err := tmuxCtrl.SwitchToWindow(windowName); err != nil {
+		return fmt.Errorf("failed to switch to window: %w", err)
+	}
+
+	fmt.Printf("Switched to window '%s'\n", windowName)
+	return nil
+}
+
+func runWindowClose(cmd *cobra.Command, args []string) error {
+	if err := requireMuxctlSession(); err != nil {
+		return err
+	}
+
+	windowName := args[0]
+
+	// Check if window exists
+	if !tmuxCtrl.WindowExists(windowName) {
+		return fmt.Errorf("window '%s' does not exist", windowName)
+	}
+
+	// Close window
+	if err := tmuxCtrl.CloseWindow(windowName); err != nil {
+		return fmt.Errorf("failed to close window: %w", err)
+	}
+
+	fmt.Printf("Closed window '%s'\n", windowName)
+	return nil
+}
+
+func runWindowExists(cmd *cobra.Command, args []string) error {
+	if err := requireMuxctlSession(); err != nil {
+		return err
+	}
+
+	windowName := args[0]
+
+	if tmuxCtrl.WindowExists(windowName) {
+		fmt.Printf("Window '%s' exists\n", windowName)
+		return nil
+	}
+
+	// Exit with non-zero status if doesn't exist
+	return fmt.Errorf("window '%s' does not exist", windowName)
+}
+
+func runWindowRun(cmd *cobra.Command, args []string) error {
+	if err := requireMuxctlSession(); err != nil {
+		return err
+	}
+
+	if len(args) < 1 {
+		return fmt.Errorf("window name required")
+	}
+
+	windowName := args[0]
+	var cmdArgs []string
+
+	// Find the -- separator
+	for i, arg := range args {
+		if arg == "--" {
+			if i+1 < len(args) {
+				cmdArgs = args[i+1:]
+			}
+			break
+		}
+	}
+
+	if len(cmdArgs) == 0 {
+		return fmt.Errorf("no command specified (use -- before command)")
+	}
+
+	// Check if window exists
+	if !tmuxCtrl.WindowExists(windowName) {
+		return fmt.Errorf("window '%s' does not exist", windowName)
+	}
+
+	// Run command in window
+	if err := tmuxCtrl.RunInWindow(windowName, cmdArgs, nil); err != nil {
+		return fmt.Errorf("failed to run command in window: %w", err)
+	}
+
+	fmt.Printf("Running command in window '%s': %s\n", windowName, strings.Join(cmdArgs, " "))
+	return nil
+}
+
 func runKill(cmd *cobra.Command, args []string) error {
 	if !tmuxCtrl.Available() {
 		return fmt.Errorf("tmux is not installed")
@@ -1185,15 +1531,14 @@ func runAIRequest(cmd *cobra.Command, args []string) error {
 			},
 		}
 
-		// Load context from file if provided
+		// Load content from file if provided
 		if aiContextFile != "" {
 			data, err := os.ReadFile(aiContextFile)
 			if err != nil {
 				return fmt.Errorf("failed to read context file: %w", err)
 			}
-			if err := json.Unmarshal(data, &req.Context); err != nil {
-				return fmt.Errorf("failed to parse context file: %w", err)
-			}
+			req.Context.PaneContent = string(data)
+			req.SourcePane = "" // Clear source pane since we have content
 		}
 	}
 
@@ -1217,17 +1562,3 @@ func runAIRequest(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// loadContextFromFile loads context from a JSON file.
-func loadContextFromFile(path string) (muxctx.Context, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return muxctx.Context{}, err
-	}
-
-	var ctx muxctx.Context
-	if err := json.Unmarshal(data, &ctx); err != nil {
-		return muxctx.Context{}, err
-	}
-
-	return ctx, nil
-}

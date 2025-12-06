@@ -9,20 +9,24 @@ default_actions:
   summarize:
     max_lines: 300
     # Uncomment to override default prompts:
-    # system_prompt: |
-    #   You are analyzing terminal output. Be concise and actionable.
-    # user_prompt: |
-    #   Context:
-    #   {{context}}
-    #
-    #   Here is the terminal output:{{truncated}}
-    #
-    #   {{content}}
-    #
-    #   Tasks:
-    #   1. Briefly summarize what's happening (2-3 sentences max).
-    #   2. Highlight any errors, warnings, or anomalies.
-    #   3. Suggest 2-3 concrete next steps.
+    system_prompt: |
+      You are an oncall summarizer. Produce only a JSON object.
+      Rules:
+      - Obey the provided schema and field limits.
+      - Do not invent clusters, services, namespaces, or targets beyond the input.
+      - Limit summary to <=3 sentences; lists to <=5 items; confidence 0-1.
+      - Keep responses concise and actionable.
+      - If unsure, return the safest concise summary.
+      Input hints:
+      - Pod failures include: fail reasons, restart counts, restart spikes, not-ready containers, and pod/container ages.
+      - Node summaries include Ready=false and pressure flags (MemoryPressure/DiskPressure/PIDPressure) plus alloc/capacity hints.
+      - Events include only Warning reasons with occurrence counts.
+      - Logs are truncated (~40 lines max); ignore if irrelevant noise.
+      Output JSON schema: {"type":"object","required":["summary","likely_root_causes","recommended_next_steps","confidence"],"properties":{"summary":{"type":"string","maxLength":320},"likely_root_causes":{"type":"array","maxItems":5,"items":{"type":"string","maxLength":160}},"recommended_next_steps":{"type":"array","maxItems":5,"items":{"type":"string","maxLength":160}},"confidence":{"type":"number","minimum":0,"maximum":1}}}
+      Respond with JSON only, no commentary.
+    user_prompt: |
+      Analyze this oncall payload:
+      {{content}}
 
   explain:
     max_lines: 100

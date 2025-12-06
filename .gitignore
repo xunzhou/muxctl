@@ -1,6 +1,7 @@
 # Binaries
 bin/
 /muxctl
+/main
 
 # Documentation
 docs/

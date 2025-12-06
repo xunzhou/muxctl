@@ -67,6 +67,46 @@ func (e *Engine) IsEnabled() bool {
 	return e.cfg.IsEnabled()
 }
 
+// GetProvider returns the configured AI provider name.
+func (e *Engine) GetProvider() string {
+	return e.cfg.Provider
+}
+
+// CompactConversation triggers conversation summarization/compaction.
+// Different providers use different commands:
+// - Claude Code: /compact
+// - Gemini: /compress
+// - Codex: /compact
+// - Aider: Not supported (would lose context)
+func (e *Engine) CompactConversation(ctx context.Context) error {
+	if !e.IsEnabled() {
+		return fmt.Errorf("AI features are disabled")
+	}
+
+	var compactCmd string
+	switch e.cfg.Provider {
+	case "claude-code":
+		compactCmd = "/compact"
+	case "gemini":
+		compactCmd = "/compress"
+	case "codex":
+		compactCmd = "/compact"
+	case "aider":
+		// Aider's /clear wipes all context, not suitable for compaction
+		return fmt.Errorf("compaction not supported for aider (use manual context management)")
+	default:
+		return fmt.Errorf("compaction not supported for provider: %s", e.cfg.Provider)
+	}
+
+	// Send the compact command as a message
+	messages := []Message{
+		{Role: "user", Content: compactCmd},
+	}
+
+	_, err := e.client.Chat(ctx, messages)
+	return err
+}
+
 // Run executes an AI action.
 func (e *Engine) Run(ctx context.Context, action ActionType, input ActionInput) (*ActionResult, error) {
 	if !e.IsEnabled() {

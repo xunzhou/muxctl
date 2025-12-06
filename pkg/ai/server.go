@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	intai "github.com/xunzhou/muxctl/internal/ai"
 	intctx "github.com/xunzhou/muxctl/internal/context"
@@ -21,6 +22,8 @@ type Server struct {
 	listener   net.Listener
 	tmuxCtrl   *tmux.TmuxController
 	engine     *intai.Engine
+	aiConfig   intai.Config
+	convMgr    *ConversationManager
 
 	mu       sync.Mutex
 	running  bool
@@ -49,6 +52,8 @@ func NewServer(session string, tmuxCtrl *tmux.TmuxController) (*Server, error) {
 		socketPath: SocketPath(session),
 		tmuxCtrl:   tmuxCtrl,
 		engine:     engine,
+		aiConfig:   cfg,
+		convMgr:    NewConversationManager(),
 		shutdown:   make(chan struct{}),
 	}, nil
 }
@@ -131,10 +136,57 @@ func (s *Server) acceptLoop() {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	// Decode request
-	var req Request
+	// Peek at JSON to determine request type
+	// Try to decode as conversation request first
 	decoder := json.NewDecoder(conn)
-	if err := decoder.Decode(&req); err != nil {
+
+	// Decode into a generic map to inspect the request
+	var rawReq map[string]interface{}
+	if err := decoder.Decode(&rawReq); err != nil {
+		s.sendResponse(conn, Response{
+			Success: false,
+			Error:   fmt.Sprintf("invalid request: %v", err),
+		})
+		return
+	}
+
+	// Check if this is a conversation request (has "action" field with conversation actions)
+	if action, ok := rawReq["action"].(string); ok {
+		switch ConversationAction(action) {
+		case ConvActionStart, ConvActionSend, ConvActionEnd, ConvActionResize, ConvActionCompact:
+			// Re-marshal and decode as ConversationRequest
+			data, _ := json.Marshal(rawReq)
+			var convReq ConversationRequest
+			if err := json.Unmarshal(data, &convReq); err != nil {
+				s.sendConvResponse(conn, ConversationResponse{
+					Success: false,
+					Error:   fmt.Sprintf("invalid conversation request: %v", err),
+				})
+				return
+			}
+
+			debug.Log("AI server received conversation request: action=%s conv_id=%s",
+				convReq.Action, convReq.ConversationID)
+
+			// Validate and process conversation request
+			if err := convReq.Validate(); err != nil {
+				s.sendConvResponse(conn, ConversationResponse{
+					Success: false,
+					Error:   err.Error(),
+				})
+				return
+			}
+
+			resp := s.processConversationRequest(convReq)
+			s.sendConvResponse(conn, resp)
+			return
+		}
+	}
+
+	// Otherwise, process as regular Request
+	data, _ := json.Marshal(rawReq)
+	var req Request
+	if err := json.Unmarshal(data, &req); err != nil {
 		s.sendResponse(conn, Response{
 			Success: false,
 			Error:   fmt.Sprintf("invalid request: %v", err),
@@ -282,4 +334,273 @@ func splitLines(content string) []string {
 		lines = append(lines, content[start:])
 	}
 	return lines
+}
+
+// processConversationRequest handles conversation-specific actions.
+func (s *Server) processConversationRequest(req ConversationRequest) ConversationResponse {
+	switch req.Action {
+	case ConvActionStart:
+		return s.handleConversationStart(req)
+	case ConvActionSend:
+		return s.handleConversationSend(req)
+	case ConvActionEnd:
+		return s.handleConversationEnd(req)
+	case ConvActionResize:
+		return s.handleConversationResize(req)
+	case ConvActionCompact:
+		return s.handleConversationCompact(req)
+	default:
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("unsupported conversation action: %s", req.Action),
+		}
+	}
+}
+
+// handleConversationStart initiates a new conversation.
+func (s *Server) handleConversationStart(req ConversationRequest) ConversationResponse {
+	// Create conversation context
+	ctx := ConversationContext{
+		AlertFingerprint: req.Context.AlertFingerprint,
+		Cluster:          req.Context.Cluster,
+		Namespace:        req.Context.Namespace,
+		InitialSummary:   req.Context.InitialSummary,
+		Metadata:         make(map[string]string),
+	}
+
+	// Copy metadata
+	for k, v := range req.Context.Metadata {
+		if str, ok := v.(string); ok {
+			ctx.Metadata[k] = str
+		}
+	}
+
+	// Start conversation
+	conv, err := s.convMgr.Start(ctx)
+	if err != nil {
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to start conversation: %v", err),
+		}
+	}
+
+	// Resize right pane if requested
+	if req.Options.ExpandWidth > 0 {
+		if err := s.tmuxCtrl.ResizePane(tmux.RoleRight, req.Options.ExpandWidth); err != nil {
+			debug.Log("Failed to resize pane: %v", err)
+			// Non-fatal, continue
+		}
+	}
+
+	// Focus right pane for conversation
+	s.tmuxCtrl.FocusPane(tmux.RoleRight)
+
+	// Clear right pane
+	s.tmuxCtrl.ClearPane(tmux.RoleRight)
+
+	debug.Log("Started conversation: id=%s cluster=%s alert=%s",
+		conv.ID, ctx.Cluster, ctx.AlertFingerprint[:8])
+
+	return ConversationResponse{
+		Success:        true,
+		ConversationID: conv.ID,
+		TurnCount:      0,
+		State:          string(conv.State),
+	}
+}
+
+// handleConversationSend sends a message and gets AI response.
+func (s *Server) handleConversationSend(req ConversationRequest) ConversationResponse {
+	conv, err := s.convMgr.Get(req.ConversationID)
+	if err != nil {
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("conversation not found: %v", err),
+		}
+	}
+
+	// Add user message to conversation
+	if err := s.convMgr.AddTurn(conv.ID, "user", req.Message); err != nil {
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to add user message: %v", err),
+		}
+	}
+
+	// Get AI response by calling Chat with conversation messages
+	messages := conv.GetMessages()
+
+	// Create AI client for this request
+	aiClient, err := intai.NewClient(s.aiConfig)
+	if err != nil {
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to create AI client: %v", err),
+		}
+	}
+
+	response, err := aiClient.Chat(context.Background(), convertMessages(messages))
+	if err != nil {
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("AI request failed: %v", err),
+		}
+	}
+
+	// Add assistant response to conversation
+	if err := s.convMgr.AddTurn(conv.ID, "assistant", response); err != nil {
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to add assistant message: %v", err),
+		}
+	}
+
+	// Display response in right pane
+	s.displayConversationInPane(conv)
+
+	debug.Log("Conversation turn completed: id=%s turns=%d", conv.ID, conv.TurnCount())
+
+	return ConversationResponse{
+		Success:        true,
+		ConversationID: conv.ID,
+		Message:        response,
+		TurnCount:      conv.TurnCount(),
+		State:          string(conv.State),
+	}
+}
+
+// handleConversationEnd terminates a conversation.
+func (s *Server) handleConversationEnd(req ConversationRequest) ConversationResponse {
+	conv, err := s.convMgr.End(req.ConversationID)
+	if err != nil {
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to end conversation: %v", err),
+		}
+	}
+
+	// TODO: Persist conversation to disk for future resume capability
+	// For now, just delete from memory after a delay
+	// (In future: save to ~/.config/muxctl/conversations/)
+
+	debug.Log("Ended conversation: id=%s turns=%d", conv.ID, conv.TurnCount())
+
+	// Restore right pane to default size (40%)
+	s.tmuxCtrl.ResizePane(tmux.RoleRight, 40)
+
+	return ConversationResponse{
+		Success:        true,
+		ConversationID: conv.ID,
+		TurnCount:      conv.TurnCount(),
+		State:          string(conv.State),
+	}
+}
+
+// handleConversationResize changes the conversation pane size.
+func (s *Server) handleConversationResize(req ConversationRequest) ConversationResponse {
+	width := req.Options.ExpandWidth
+	if width == 0 {
+		width = 60 // Default expansion
+	}
+
+	if err := s.tmuxCtrl.ResizePane(tmux.RoleRight, width); err != nil {
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to resize pane: %v", err),
+		}
+	}
+
+	return ConversationResponse{
+		Success:        true,
+		ConversationID: req.ConversationID,
+	}
+}
+
+// displayConversationInPane shows the full conversation history in the right pane.
+func (s *Server) displayConversationInPane(conv *Conversation) {
+	s.tmuxCtrl.ClearPane(tmux.RoleRight)
+
+	for _, turn := range conv.Turns {
+		// Format: "User: message" or "Assistant: message"
+		prefix := "Assistant"
+		if turn.Role == "user" {
+			prefix = "You"
+		}
+
+		// Display role header
+		s.tmuxCtrl.RunInPane(tmux.RoleRight, []string{"echo", fmt.Sprintf("=== %s ===", prefix)}, nil)
+
+		// Display message content
+		lines := splitLines(turn.Content)
+		for _, line := range lines {
+			if line == "" {
+				s.tmuxCtrl.SendKeys(tmux.RoleRight, "Enter")
+			} else {
+				s.tmuxCtrl.RunInPane(tmux.RoleRight, []string{"echo", line}, nil)
+			}
+		}
+
+		// Add separator
+		s.tmuxCtrl.SendKeys(tmux.RoleRight, "Enter")
+	}
+}
+
+// convertMessages converts pkg/ai.Message to internal/ai.Message.
+func convertMessages(messages []Message) []intai.Message {
+	result := make([]intai.Message, len(messages))
+	for i, msg := range messages {
+		result[i] = intai.Message{
+			Role:    msg.Role,
+			Content: msg.Content,
+		}
+	}
+	return result
+}
+
+// handleConversationCompact triggers conversation compaction/summarization.
+func (s *Server) handleConversationCompact(req ConversationRequest) ConversationResponse {
+	// Validate conversation ID
+	if req.ConversationID == "" {
+		return ConversationResponse{
+			Success: false,
+			Error:   "conversation_id is required for compact action",
+		}
+	}
+
+	// Verify conversation exists
+	_, err := s.convMgr.Get(req.ConversationID)
+	if err != nil {
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("conversation not found: %v", err),
+		}
+	}
+
+	// Trigger compaction via AI engine
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := s.engine.CompactConversation(ctx); err != nil {
+		debug.Log("Conversation compaction failed: %v", err)
+		return ConversationResponse{
+			Success: false,
+			Error:   fmt.Sprintf("compaction failed: %v", err),
+		}
+	}
+
+	debug.Log("Conversation compacted: id=%s provider=%s", req.ConversationID, s.engine.GetProvider())
+
+	return ConversationResponse{
+		Success:        true,
+		ConversationID: req.ConversationID,
+		Message:        "Conversation compacted successfully",
+	}
+}
+
+// sendConvResponse writes a ConversationResponse to the connection.
+func (s *Server) sendConvResponse(conn net.Conn, resp ConversationResponse) {
+	encoder := json.NewEncoder(conn)
+	if err := encoder.Encode(resp); err != nil {
+		debug.Log("AI server conversation response error: %v", err)
+	}
 }
