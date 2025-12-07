@@ -133,6 +133,23 @@ Examples:
 	DisableFlagParsing: false,
 }
 
+var respawnCmd = &cobra.Command{
+	Use:   "respawn [flags] -- <command> [args...]",
+	Short: "Replace shell in a pane with a command (no shell prompt)",
+	Long: `Replaces the shell in the specified pane with a new command, avoiding shell prompt.
+This kills the current process and runs the specified command directly.
+Useful for running TUI applications without showing the shell prompt.
+
+Use --pane for muxctl-initialized sessions, or --target for any tmux session.
+
+Examples:
+  muxctl respawn --pane right -- sctl-ctxlist mysession
+  muxctl respawn --target mysession:0.2 -- sctl-ctxlist mysession
+  muxctl respawn --pane top -- htop`,
+	RunE:               runRespawn,
+	DisableFlagParsing: false,
+}
+
 var focusCmd = &cobra.Command{
 	Use:   "focus <pane>",
 	Short: "Focus on a specific pane",
@@ -465,12 +482,14 @@ PowerShell:
 
 var (
 	// Init flags
-	initTopPercent  int
-	initSidePercent int
-	initNoAttach    bool
+	initTopPercent   int
+	initSidePercent  int
+	initRightColumns int
+	initNoAttach     bool
 
 	// Run/send flags
 	paneRole      string
+	paneTarget    string
 	autoReturn    bool
 	returnToPane  string
 
@@ -497,6 +516,7 @@ func init() {
 	rootCmd.AddCommand(attachCmd)
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(respawnCmd)
 	rootCmd.AddCommand(focusCmd)
 	rootCmd.AddCommand(clearCmd)
 	rootCmd.AddCommand(toggleCmd)
@@ -530,6 +550,7 @@ func init() {
 	// Init flags
 	initCmd.Flags().IntVar(&initTopPercent, "top-percent", 30, "Percentage of screen for top pane")
 	initCmd.Flags().IntVar(&initSidePercent, "side-percent", 40, "Percentage of bottom for side pane")
+	initCmd.Flags().IntVar(&initRightColumns, "right-columns", 0, "Fixed column width for right pane (overrides --side-percent if > 0)")
 	initCmd.Flags().BoolVar(&initNoAttach, "no-attach", false, "Don't attach after init (for scripting)")
 
 	// Run flags
@@ -537,6 +558,10 @@ func init() {
 	runCmd.MarkFlagRequired("pane")
 	runCmd.Flags().BoolVar(&autoReturn, "auto-return", false, "Wait for keypress after command exits, then return focus")
 	runCmd.Flags().StringVar(&returnToPane, "return-to", "top", "Pane to focus after auto-return (default: top)")
+
+	// Respawn flags
+	respawnCmd.Flags().StringVarP(&paneRole, "pane", "p", "", "Target pane for muxctl-initialized sessions (top, left, right)")
+	respawnCmd.Flags().StringVarP(&paneTarget, "target", "t", "", "Target pane for any tmux session (format: session:window.pane)")
 
 	// Send flags
 	sendCmd.Flags().StringVarP(&paneRole, "pane", "p", "", "Target pane (required: top, left, right)")
@@ -578,8 +603,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	layout := tmux.LayoutDef{
-		TopPercent:  initTopPercent,
-		SidePercent: initSidePercent,
+		TopPercent:   initTopPercent,
+		SidePercent:  initSidePercent,
+		RightColumns: initRightColumns,
 	}
 
 	if err := tmuxCtrl.Init(sessionName, layout); err != nil {
@@ -656,6 +682,54 @@ func runRun(cmd *cobra.Command, args []string) error {
 
 	if err := tmuxCtrl.RunInPane(role, cmdArgs, ctx.Env()); err != nil {
 		return fmt.Errorf("failed to run in pane '%s': %w", role, err)
+	}
+
+	return nil
+}
+
+func runRespawn(cmd *cobra.Command, args []string) error {
+	// Find command args after "--"
+	cmdArgs := args
+	for i, arg := range os.Args {
+		if arg == "--" && i+1 < len(os.Args) {
+			cmdArgs = os.Args[i+1:]
+			break
+		}
+	}
+
+	if len(cmdArgs) == 0 {
+		return fmt.Errorf("no command specified. Usage: muxctl respawn --pane <role> -- <command>")
+	}
+
+	// Load context for env vars
+	ctxManager.Refresh()
+	ctx := ctxManager.Current()
+
+	// Support both --pane (for muxctl-initialized sessions) and --target (for any tmux session)
+	if paneTarget != "" {
+		// Using --target: works with any tmux session
+		if paneRole != "" {
+			return fmt.Errorf("cannot use both --pane and --target")
+		}
+		if err := tmuxCtrl.RespawnPaneByTarget(paneTarget, cmdArgs, ctx.Env()); err != nil {
+			return fmt.Errorf("failed to respawn pane '%s': %w", paneTarget, err)
+		}
+	} else if paneRole != "" {
+		// Using --pane: requires muxctl-initialized session
+		if err := requireMuxctlSession(); err != nil {
+			return err
+		}
+
+		role, err := tmux.ParseRole(paneRole)
+		if err != nil {
+			return err
+		}
+
+		if err := tmuxCtrl.RespawnPane(role, cmdArgs, ctx.Env()); err != nil {
+			return fmt.Errorf("failed to respawn pane '%s': %w", role, err)
+		}
+	} else {
+		return fmt.Errorf("must specify either --pane or --target")
 	}
 
 	return nil
@@ -1185,8 +1259,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// Initialize session if it doesn't exist
 	if !tmuxCtrl.SessionExists(sessionName) {
 		layout := tmux.LayoutDef{
-			TopPercent:  initTopPercent,
-			SidePercent: initSidePercent,
+			TopPercent:   initTopPercent,
+			SidePercent:  initSidePercent,
+			RightColumns: initRightColumns,
 		}
 		if err := tmuxCtrl.Init(sessionName, layout); err != nil {
 			return fmt.Errorf("failed to initialize session: %w", err)

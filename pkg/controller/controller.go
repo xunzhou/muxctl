@@ -16,6 +16,8 @@ type Controller interface {
 
 	// Pane management
 	RunInPane(role PaneRole, cmd []string, env map[string]string) error
+	RespawnPane(role PaneRole, cmd []string, env map[string]string) error
+	RespawnPaneByTarget(target string, cmd []string, env map[string]string) error
 	SendKeys(role PaneRole, keys string) error
 	CapturePane(role PaneRole, lines int) (string, error)
 	CaptureLastCommand(role PaneRole) (*CommandCapture, error)
@@ -85,6 +87,17 @@ func (c *TmuxController) Init(session string, layout LayoutDef) error {
 // RunInPane runs a command in the specified pane.
 func (c *TmuxController) RunInPane(role PaneRole, cmd []string, env map[string]string) error {
 	return c.impl.RunInPane(tmux.PaneRole(role), cmd, env)
+}
+
+// RespawnPane replaces the shell in a pane with a new command, avoiding shell prompt.
+func (c *TmuxController) RespawnPane(role PaneRole, cmd []string, env map[string]string) error {
+	return c.impl.RespawnPane(tmux.PaneRole(role), cmd, env)
+}
+
+// RespawnPaneByTarget replaces the shell in a pane using a tmux target.
+// Works with any tmux session, not just muxctl-initialized sessions.
+func (c *TmuxController) RespawnPaneByTarget(target string, cmd []string, env map[string]string) error {
+	return c.impl.RespawnPaneByTarget(target, cmd, env)
 }
 
 // SendKeys sends raw keystrokes to a pane.

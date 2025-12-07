@@ -2,6 +2,8 @@
 // This package wraps internal/tmux for use by external modules.
 package controller
 
+import "fmt"
+
 // PaneRole identifies the logical role of a pane.
 type PaneRole string
 
@@ -62,4 +64,15 @@ type CommandCapture struct {
 // ValidRoles returns all valid pane role names.
 func ValidRoles() []PaneRole {
 	return []PaneRole{RoleTop, RoleLeft, RoleRight}
+}
+
+// ParseRole parses a string into a PaneRole, returning an error if invalid.
+func ParseRole(s string) (PaneRole, error) {
+	role := PaneRole(s)
+	for _, valid := range ValidRoles() {
+		if role == valid {
+			return role, nil
+		}
+	}
+	return "", fmt.Errorf("invalid pane role: %s (valid: top, left, right)", s)
 }

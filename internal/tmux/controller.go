@@ -61,8 +61,9 @@ type CommandCapture struct {
 
 // LayoutDef defines a desired pane layout.
 type LayoutDef struct {
-	TopPercent  int // percentage for top pane (default 30)
-	SidePercent int // percentage for side pane (default 40)
+	TopPercent   int // percentage for top pane (default 30)
+	SidePercent  int // percentage for side pane (default 40, ignored if RightColumns > 0)
+	RightColumns int // fixed column width for right pane (if > 0, overrides SidePercent)
 }
 
 // DefaultLayout returns the default 3-pane layout.
@@ -354,8 +355,15 @@ func (c *TmuxController) createLayout(basePaneID string, layout LayoutDef) error
 	bottomPaneID := panes[1].ID
 
 	// Step 2: Split bottom pane vertically to create logs/side
-	cmd = exec.Command("tmux", "split-window", "-t", bottomPaneID, "-h", "-p", fmt.Sprintf("%d", sidePercent))
-	if err := cmd.Run(); err != nil {
+	var cmd2 *exec.Cmd
+	if layout.RightColumns > 0 {
+		// Use fixed column width for right pane
+		cmd2 = exec.Command("tmux", "split-window", "-t", bottomPaneID, "-h", "-l", fmt.Sprintf("%d", layout.RightColumns))
+	} else {
+		// Use percentage for right pane
+		cmd2 = exec.Command("tmux", "split-window", "-t", bottomPaneID, "-h", "-p", fmt.Sprintf("%d", sidePercent))
+	}
+	if err := cmd2.Run(); err != nil {
 		return fmt.Errorf("failed to split logs/side: %w", err)
 	}
 
@@ -564,6 +572,64 @@ func (c *TmuxController) SendKeys(role PaneRole, keys string) error {
 	debug.Log("SendKeys: role=%s pane=%s keys=%q", role, paneID, keys)
 
 	cmd := exec.Command("tmux", "send-keys", "-t", paneID, keys)
+	return cmd.Run()
+}
+
+// RespawnPane replaces the shell in a pane with a new command, avoiding shell prompt.
+// This kills the current process and runs the specified command directly.
+func (c *TmuxController) RespawnPane(role PaneRole, cmdArgs []string, env map[string]string) error {
+	paneID, ok := c.GetPaneID(role)
+	if !ok {
+		return fmt.Errorf("pane '%s' not found or not initialized", role)
+	}
+
+	if len(cmdArgs) == 0 {
+		return fmt.Errorf("no command specified")
+	}
+
+	debug.Log("RespawnPane: role=%s pane=%s cmd=%v env=%v", role, paneID, cmdArgs, env)
+
+	// Build tmux command: respawn-pane -k -t <pane> [-e KEY=VAL]... <command>
+	args := []string{"respawn-pane", "-k", "-t", paneID}
+
+	// Add muxctl detection variables
+	args = append(args, "-e", fmt.Sprintf("MUXCTL=%s", c.sessionName))
+	args = append(args, "-e", fmt.Sprintf("MUXCTL_PANE=%s", role))
+
+	// Add user-provided env vars
+	for k, v := range env {
+		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+	}
+
+	// Add the command to run
+	args = append(args, cmdArgs...)
+
+	cmd := exec.Command("tmux", args...)
+	return cmd.Run()
+}
+
+// RespawnPaneByTarget replaces the shell in a pane using a tmux target, avoiding shell prompt.
+// This works with any tmux session, not just muxctl-initialized sessions.
+// Target format: "session:window.pane" (e.g., "mysession:0.2")
+func (c *TmuxController) RespawnPaneByTarget(target string, cmdArgs []string, env map[string]string) error {
+	if len(cmdArgs) == 0 {
+		return fmt.Errorf("no command specified")
+	}
+
+	debug.Log("RespawnPaneByTarget: target=%s cmd=%v env=%v", target, cmdArgs, env)
+
+	// Build tmux command: respawn-pane -k -t <target> [-e KEY=VAL]... <command>
+	args := []string{"respawn-pane", "-k", "-t", target}
+
+	// Add user-provided env vars
+	for k, v := range env {
+		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+	}
+
+	// Add the command to run
+	args = append(args, cmdArgs...)
+
+	cmd := exec.Command("tmux", args...)
 	return cmd.Run()
 }
 
