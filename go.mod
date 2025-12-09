@@ -1,4 +1,4 @@
-module github.com/example/muxctl
+module github.com/xunzhou/muxctl
 
 go 1.21
 
